@@ -1,3 +1,9 @@
+# Portions of this file are adapted from Hibiki-Zero:
+# Copyright (c) 2026 kyutai
+# Licensed under the MIT License. See THIRD_PARTY_NOTICES.md and
+# LICENSES/Hibiki-Zero-MIT.txt for attribution and the complete license text.
+# Source revision: https://github.com/kyutai-labs/hibiki-zero/tree/871e89d078202c7d9d18d0924bd76cf161cd6606
+
 import io
 import csv
 import os
@@ -10,13 +16,13 @@ from pathlib import Path
 import sentencepiece
 import torch
 import sphn
-from hibiki_zero.client_utils import audio_read, stack_and_pad_audio
+from hibiki_zero.client_utils import audio_read
 from hibiki_zero.run import DEFAULT_REPO
 
 from moshi.models import LMGen, MimiModel, loaders
-from hibiki_zero.inference import get_lmgen, seed_all, encode_inputs
+from hibiki_zero.inference import get_lmgen, seed_all
 
-# Use 10 for the initial proof-of-concept. Set this to None for the full dataset.
+# Using 10 rows for the initial proof-of-concept.
 dataset_row_limit: int | None = 10
 
 
@@ -29,14 +35,14 @@ def get_vsc5_paths() -> tuple[Path, Path, Path]:
 
     data_directory = Path(data_environment_variable).expanduser().resolve()
     dataset_directory = (
-        data_directory
-        / "24kHz covost_v2-de_en"
-        / "covost_v2-de_en"
+            data_directory
+            / "24kHz covost_v2-de_en"
+            / "covost_v2-de_en"
     )
     model_results_directory = (
-        data_directory
-        / "unchecked_model_results"
-        / "hibiki_zero"
+            data_directory
+            / "unchecked_model_results"
+            / "hibiki_zero"
     )
 
     return (
@@ -45,6 +51,9 @@ def get_vsc5_paths() -> tuple[Path, Path, Path]:
         model_results_directory / "translated_audio",
     )
 
+
+# Adapted from Hibiki-Zero's model-loading and inference implementation under
+# the MIT License; see the file-level notice above.
 # Since Hibiki-Zero doesn't directly support big dataset testing (is limited to batch functionality) it is needed to load
 # the model components so that translation tests can be run in a loop without always restarting/reloading the model when
 # using the standard hibiki-zero generate command
@@ -62,6 +71,7 @@ class GeneratedTranslation:
     path_to_translated_audio: Path
     # Time that passed since the start of the input audio till the first chunk of the output audio (first chunk could be just silence)
     output_audio_start_delay: float
+
 
 @dataclass
 class ModelResult:
@@ -82,6 +92,7 @@ class ModelResult:
     bleu: float | None = None
     asr_bleu: float | None = None
     asr_comet: float | None = None
+
 
 def main() -> None:
     (
@@ -168,6 +179,10 @@ def loading_model(device: str = "cuda", fuse_lora=True, ) -> LoadedModel:
     # https://github.com/kyutai-labs/hibiki-zero/blob/main/hibiki_zero/run.py#L267 last visit: 12.10.2026
     lm_gen: LMGen = get_lmgen(lm=lm, checkpoint_info=checkpoint_info, batch_size=1)
 
+    # Runs the warmup process before starting the live translation
+    # https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L64
+    warm_up_live_model(mimi=mimi, lm_gen=lm_gen)
+
     return LoadedModel(
         mimi_instance=mimi,
         text_tokenizer=text_tokenizer,
@@ -181,13 +196,12 @@ def run_model(dataset: list[dict[str, str]],
               output_results_path: Path,
               translated_audio_output_directory: Path,
               ) -> list[ModelResult]:
-
     model_results: list[ModelResult] = []
 
     translated_audio_output_directory.mkdir(parents=True, exist_ok=True)
     output_results_path.parent.mkdir(parents=True, exist_ok=True)
 
-    #Defines the needed columns of the output result tsv
+    # Defines the needed columns of the output result tsv
     fieldnames = [field.name for field in fields(ModelResult)]
 
     with output_results_path.open("w", encoding="utf-8", newline="") as output_file:
@@ -195,18 +209,18 @@ def run_model(dataset: list[dict[str, str]],
         writer.writeheader()
 
         for row_data in dataset:
-            #Writes the already known data into the variables that are used to built up the result tsv
+            # Writes the already known data into the variables that are used to built up the result tsv
             path_to_original_audio = Path(row_data["path"]).resolve()
             original_transcription = row_data["sentence"]
             expected_translation = row_data["translation"]
 
-            #Reuses the unique identifier of the original audio paths
+            # Reuses the unique identifier of the original audio paths
             output_audio_path = (
                     translated_audio_output_directory
                     / f"{path_to_original_audio.stem}.wav"
             )
 
-            #Hibiki translation
+            # Hibiki translation
             generated_translation = generate_translation(
                 path_to_original_audio=path_to_original_audio,
                 output_audio_path=output_audio_path,
@@ -227,7 +241,44 @@ def run_model(dataset: list[dict[str, str]],
 
     return model_results
 
-#TODO read about torch.no_grad functionality
+
+# torch.no_grad() is recommended when only running a trained model and not needing information for model training.
+# https://docs.pytorch.org/docs/2.14/generated/torch.no_grad.html, last visit 21.10.2026
+@torch.no_grad()
+def warm_up_live_model(mimi: MimiModel, lm_gen: LMGen) -> None:
+    device = lm_gen.lm_model.device
+    # A model step is 80 milliseconds and now the question is how many samples are included in that time frame
+    # This boils down to 24000/12.5 = 1920 audio samples per frame
+    frame_size = int(mimi.sample_rate / mimi.frame_rate)
+
+    with mimi.streaming(batch_size=1), lm_gen.streaming(batch_size=1):
+
+        # model warmup
+        # https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L64-74
+        for _warmup_step in range(4):
+            chunk = torch.zeros(
+                1,
+                1,
+                frame_size,
+                dtype=torch.float32,
+                device=device,
+            )
+            # Encoding of input audio returns "... an int tensor of shape [B, K, T] ..." K represents the amount of audio tokens
+            # of a single frame with each token representing a different audio detail.
+            # https://github.com/kyutai-labs/moshi/blob/main/moshi/moshi/models/compression.py#L383
+            codes = mimi.encode(chunk)
+            # codes is an int tensor of shape [B, K, T] (See variable initialization) and T being the audio frames
+            for code_index in range(codes.shape[-1]):
+                tokens = lm_gen.step(codes[:, :, code_index:code_index + 1])
+                # ":" -> all batch entries (in our case always 1)
+                # ":" -> all code books
+                # "0: 0 + 1" -> all audio frames from position 0 till but not included 1.
+                if tokens is not None:
+                    _ = mimi.decode(tokens[:, 1:])
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
 
 @torch.no_grad()
 def generate_translation(path_to_original_audio: Path,
@@ -235,203 +286,280 @@ def generate_translation(path_to_original_audio: Path,
                          loaded_model: LoadedModel,
                          generation_window_seconds: float = 120.0,
                          ) -> GeneratedTranslation:
-    # mimi = loaded_model.mimi_instance
-    # lm_gen = loaded_model.lm_gen
-    # text_tokenizer = loaded_model.text_tokenizer
-    # sample_rate = mimi.sample_rate
-
-    # original_audio, _ = audio_read(
-    #    path_to_original_audio,
-    #    mono=True,
-    # )
-    # start_of_input_stream = time.perf_counter()
-
-    # tranlsated_text = text_tokenizer.decode(
-    #    translated_text_tokens
-    # )
-
-    # return GeneratedTranslation(
-    #    translated_text=translated_text,
-    #    path_to_translated_audio=path_to_translated_audio,
-    #    output_audio_start_delay=output_audio_start_delay
-    # )
-
-    ########################################################################################################
-    ########################################################################################################
-    ########################################################################################################
-    # Just copy pasted for a Proof of Concept
-    # TODO: Code review/revision/description
-    ########################################################################################################
-    ########################################################################################################
-    ########################################################################################################
-
     """
-        Generates one translation with batch size 1.
+    Replays one audio file through Hibiki-Zero's live inference path.
 
-        Input tokens are supplied according to Mimi's real-time frame rate.
-        The model weights remain loaded between calls; only the streaming
-        state is recreated.
-        """
+    Raw mono PCM is made available one Mimi frame at a time. Each frame is
+    encoded by Mimi, processed by LMGen, and any generated target-audio tokens
+    are immediately decoded by Mimi. Model weights remain loaded between
+    calls, while the streaming state is recreated for every file.
+
+    The finite-file evaluation adds an input-EOS frame after the source audio
+    and then streams silence until the target EOS or generation-window limit.
+    """
+
     mimi = loaded_model.mimi_instance
     lm_gen = loaded_model.lm_gen
     text_tokenizer = loaded_model.text_tokenizer
 
     sample_rate = mimi.sample_rate
+    # mimi runs on a framerate of 12.5Hz
+    # Therefore 1/12.5 = 0.08s means that the model steps are 80 milliseconds apart
+    # https://huggingface.co/kyutai/mimi, last visit 21.10.2026
     frame_duration_seconds = 1.0 / mimi.frame_rate
+    # A model step is 80 milliseconds and now the question is how many samples are included in that time frame
+    # This boils down to 24000/12.5 = 1920 audio samples per frame
+    frame_size = int(sample_rate / mimi.frame_rate)
+    device = lm_gen.lm_model.device
 
-    # The data is guaranteed to be WAV at 24 kHz.
+    # The audio sample rate was preprocessed to the needed 24 kHz.
+    # Mimi expects only 1 audio channel per default therefore mono is being ensured.
+    # https://huggingface.co/docs/transformers/model_doc/mimi
     input_wav, _ = audio_read(
         path_to_original_audio,
         mono=True,
     )
 
-    # Ensures shape [channels, samples].
-    # This is shape normalization, not a format/sample-rate check.
-    if input_wav.ndim == 1:
-        input_wav = input_wav.unsqueeze(0)
-
-    input_duration_seconds = (
-            input_wav.shape[-1] / sample_rate
-    )
-
-    # Batch size is exactly 1.
-    batch_wav = stack_and_pad_audio(
-        [input_wav],
-        max_len=int(
-            generation_window_seconds * sample_rate
-        ),
-    )
-
-    # Encoding is performed before the streaming clock begins.
-    # During generation, the resulting codes are supplied at 12.5 Hz.
-    input_codes, warmup_codes = encode_inputs(
-        batch_wavs=batch_wav,
-        mimi=mimi,
-        lm_gen=lm_gen,
-        audio_durations=[input_duration_seconds],
+    # 48000 samples with a sample rate of 24000 equals 2 seconds of audio duration
+    audio_sample_amount = input_wav.shape[-1]
+    # Amount of frames that are needed for this audio.
+    source_frame_count = (
+                                 audio_sample_amount + frame_size - 1
+                         ) // frame_size
+    # Hibiki translates audio which has a maximum of 120sec * 12.5 = 1500 frames
+    maximum_stream_frame_count = int(
+        generation_window_seconds * mimi.frame_rate
     )
 
     generated_text_token_ids: list[int] = []
 
-    # Contains decoded audio and any silence inserted for runtime gaps.
     output_audio_parts: list[torch.Tensor] = []
 
+    # For output delay measurement
+    # Begins counting when the input audio starts.
     output_audio_start_seconds: float | None = None
+    # Begins counting when first output chunk is available.
     current_output_duration_seconds = 0.0
     eos_generated = False
     parts_after_last_text_token: int | None = None
+    input_eos_sent = False
 
-    device = lm_gen.lm_model.device
+    silence_frame = torch.zeros(
+        1,
+        frame_size,
+        dtype=input_wav.dtype,
+    )
 
-    # Both objects receive a fresh streaming state for this file.
+    # Activates a new streaming session without needing to reload the model.
+    # https://github.com/kyutai-labs/moshi/blob/main/moshi/moshi/modules/streaming.py#L132
     with lm_gen.streaming(batch_size=1), mimi.streaming(
             batch_size=1
     ):
-        # Algorithmic preparation used by the official generate()
-        # implementation. It is completed before the measurement starts.
-        for step in range(warmup_codes.shape[-1]):
-            lm_gen.step(
-                warmup_codes[:, :, step: step + 1]
-            )
-
-        # Ensure that preceding CUDA work is complete before starting
-        # the common input/output clock.
+        # Waits for GPU to finish before starting the new timer
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
         input_stream_started_at = time.perf_counter()
 
-        for step in range(input_codes.shape[-1]):
-            # Input code step 0 represents the first complete Mimi frame.
-            # It becomes available after one frame duration.
-            frame_deadline = (
+        # first input audio frame is ignored in the official implementation
+        # https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L138-L144
+        skip_frames = 1
+
+        for step in range(maximum_stream_frame_count):
+
+            # starting time + (0 + 1) * 0,08
+            input_audio_deadline = (
                     input_stream_started_at
                     + (step + 1) * frame_duration_seconds
             )
 
+            # (starting time + (0 + 1) * 0,08) - (starting time + time that passed)
             remaining_wait_seconds = (
-                    frame_deadline - time.perf_counter()
+                    input_audio_deadline - time.perf_counter()
             )
 
+            # simulates the 80 milliseconds of input audio recording while performing live translation
             if remaining_wait_seconds > 0:
                 time.sleep(remaining_wait_seconds)
 
-            tokens = lm_gen.step(
-                input_codes[:, :, step: step + 1]
-            )
+            # if last frame of input audio frames was not reached
+            if step < source_frame_count:
+                # 0 = 0*1920
+                frame_start = step * frame_size
+                frame_end = min(
+                    frame_start + frame_size,
+                    # special case where last frame is reached and not enough audio samples are left to fill the frame
+                    audio_sample_amount,
+                )
+                # loads the 80 millisecond frame (in case of the last frame it could be shorter)
+                pcm_frame = input_wav[:, frame_start:frame_end]
 
-            if tokens is None:
-                continue
+                # calculation of the missing samples. If > 0 then audio is shorter than 1920 samples and needs to be padded with zeros
+                missing_samples = frame_size - pcm_frame.shape[-1]
+                if missing_samples > 0:
+                    pcm_frame = torch.nn.functional.pad(
+                        pcm_frame,
+                        (0, missing_samples),
+                    )
+            else:
+                pcm_frame = silence_frame
 
-            text_token_id = int(
-                tokens[0, 0, 0].item()
-            )
+            # Adds a third dimension (batch dimension to the pcm_frame tensor)
+            # When looking at the referenced code one can see that originally batch and channel was added this way.
+            # https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L136
+            pcm_frame = pcm_frame.to(device=device)[None]
 
-            source_timeline_seconds = (
-                    (step + 1) * frame_duration_seconds
-            )
+            # Encoding of input audio returns "... an int tensor of shape [B, K, T] ..." K represents the amount of audio tokens
+            # of a single frame with each token representing a different audio detail.
+            # https://github.com/kyutai-labs/moshi/blob/main/moshi/moshi/models/compression.py#L383
+            codes = mimi.encode(pcm_frame)
 
-            # Ignore an EOS emitted before the source has finished.
-            # This reflects Hibiki's intention to avoid premature EOS.
-            if (
-                    text_token_id == text_tokenizer.eos_id()
-                    and source_timeline_seconds
-                    < input_duration_seconds
-            ):
-                text_token_id = text_tokenizer.pad_id()
+            if skip_frames:
+                ### https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L139-142
+                # "The first input audio frame is ignored, as from the point of
+                # view of the model it is in the past. We still `mimi.encode` for simplicity,
+                # however as the first encoded frame has a specific structure (due to the left padding),
+                # we reset the streaming state of the encoder to reapply the padding on the next call."
+                ###
+                mimi.reset_streaming()
+                skip_frames -= 1
 
-            generated_text_token_ids.append(
-                text_token_id
-            )
+            # Marks the end of the input audio and therefore adds an end of sequence token
+            # In the original streaming code the closing is based on a closed web socket
+            # https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L105-L158 last visit: 02.11.2026
+            # In the original translation of already available audio an end of sequence token is placed inside the fully available audio sequence
+            # https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L190 last visit: 02.11.2026
+            # In this case there is no websocket to close and since I simulate a livestream frame by fram I also don't have the whole sequence
+            # Therefore the whole "codes" variable of this frame is being set as an end of sequence token.
+            # This is done by setting the codebook values to 2048 (out of the range of the normal codebook values)
+            # https://github.com/kyutai-labs/moshi/blob/main/moshi/moshi/quantization/vq.py#L144-145 last visit: 02.11.2026
+            # place where cardinality 2048 is defined
+            # https://github.com/kyutai-labs/moshi/blob/main/moshi/moshi/models/loaders.py#L61
+            if step == source_frame_count:
+                codes = torch.full_like(
+                    codes,
+                    fill_value=mimi.cardinality,
+                )
+                input_eos_sent = True
 
-            # EOS marks the end of the target sequence. The audio tokens
-            # belonging to this EOS step are not included in the output.
-            if text_token_id == text_tokenizer.eos_id():
-                eos_generated = True
+            # codes.shape[-1] includes the information how many frames there are in "codes" and since each frame
+            # is processed separately this value is typically 1. (I left the loop there because this process is also in the live implementation)
+            # https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L145-148 last visit: 02.11.2026
+            for code_index in range(codes.shape[-1]):
+
+                #audio/text translation process
+                #https://github.com/kyutai-labs/moshi/blob/main/moshi/moshi/models/lm.py#L788 last visit: 04.11.2026
+                #https://github.com/kyutai-labs/moshi/blob/main/moshi/moshi/models/lm.py#L669 last visit: 04.11.2026
+                tokens = lm_gen.step(
+                    # Sends the first (and only) frame to lm_gen.step
+                    codes[:, :, code_index:code_index + 1]
+                )
+                if tokens is None:
+                    continue
+
+                #Code as in:
+                #https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L79-81 last visit:03.11.2026
+                #The connection that dep_q is set to 16 is really hard to display therefore I only reference the source of 16 in the config file.
+                #https://huggingface.co/kyutai/hibiki-zero-3b-pytorch-bf16/blob/main/config.json#L4 last visit: 04.11.2026
+                #In general dep_q is the number of target audio codebook streams
+                #https://github.com/kyutai-labs/moshi/blob/main/moshi/moshi/models/lm.py#L54 last visit: 04.11.2026
+                #https://github.com/kyutai-labs/moshi/blob/main/moshi/moshi/models/lm.py#L188 last visit: 04.11.2026
+                assert tokens.shape[1] == lm_gen.lm_model.dep_q + 1
+                #"tokens" stores the 16 audio streams from index 1-16 (index 0 is text token)
+                #https://github.com/kyutai-labs/moshi/blob/main/moshi/moshi/models/lm.py#L762-L767 last visit: 05.11.2026
+                #Therefore here only the audio codebook streams are being decoded
+                decoded_chunk = mimi.decode(tokens[:, 1:]).cpu()[0]
+
+                ########## Benchmark ##########
+
+                #First output chunk is available therefore the timer for TTFA is set.
+                chunk_ready_seconds = (
+                        time.perf_counter()
+                        - input_stream_started_at
+                )
+                #For the first frame of the audio sequence
+                if output_audio_start_seconds is None:
+                    output_audio_start_seconds = chunk_ready_seconds
+                else:
+                    # Reconstruct a zero-buffer playback timeline. If the WAV
+                    # content collected so far would already have finished
+                    # playing before this chunk became available, the missing
+                    # interval is an audible runtime gap and is represented by
+                    # silence. Forced-alignment timestamps therefore retain
+                    # internal generation stalls.
+                    chunk_available_in_output_seconds = (
+                            chunk_ready_seconds
+                            - output_audio_start_seconds
+                    )
+                    gap_seconds = (
+                            chunk_available_in_output_seconds
+                            - current_output_duration_seconds
+                    )
+                    gap_samples = max(
+                        0,
+                        round(gap_seconds * sample_rate),
+                    )
+
+                    if gap_samples > 0:
+                        output_audio_parts.append(
+                            torch.zeros(
+                                decoded_chunk.shape[0],  # 1 (Batch amount)
+                                gap_samples,
+                                dtype=decoded_chunk.dtype,
+                                device=decoded_chunk.device,
+                            )
+                        )
+                        current_output_duration_seconds += (
+                                gap_samples / sample_rate
+                        )
+                ########## Benchmark end ##########
+
+                #decoded output audio is added
+                output_audio_parts.append(decoded_chunk)
+                current_output_duration_seconds += (
+                        decoded_chunk.shape[-1] / sample_rate
+                )
+
+                #Right before the Benchmark code the audio streams where selected and decoded (line ~471) next step is to retrieve
+                #the text token at index 0.
+                #https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L85 last visit: 05.11.26
+                text_token_id = int(tokens[0, 0, 0].item())
+                #text_token_ids are collected
+                generated_text_token_ids.append(text_token_id)
+
+                if text_token_id > text_tokenizer.pad_id():
+                    parts_after_last_text_token = len(output_audio_parts)
+
+                # The official server reports output EOS but keeps the socket
+                # alive. A finite-file evaluation can end once both the source
+                # EOS was supplied and the target EOS was generated.
+                if (
+                        input_eos_sent
+                        and text_token_id == text_tokenizer.eos_id()
+                ):
+                    eos_generated = True
+                    break
+
+            if eos_generated:
                 break
 
-            # Channel 0 is text; channels 1... contain target audio.
-            decoded_chunk = mimi.decode(
-                tokens[:, 1:]
-            )
-
-            # Moving to CPU waits until the decoded PCM is actually ready.
-            decoded_chunk = decoded_chunk.cpu()[0]
-
-            chunk_ready_seconds = (
-                    time.perf_counter()
-                    - input_stream_started_at
-            )
-
-            (
-                output_audio_start_seconds,
-                current_output_duration_seconds,
-            ) = append_audio_chunk_to_timeline(
-                audio_parts=output_audio_parts,
-                audio_chunk=decoded_chunk,
-                chunk_ready_seconds=chunk_ready_seconds,
-                output_audio_start_seconds=(
-                    output_audio_start_seconds
-                ),
-                current_output_duration_seconds=(
-                    current_output_duration_seconds
-                ),
-                sample_rate=sample_rate,
-            )
-
-            if text_token_id > text_tokenizer.pad_id():
-                parts_after_last_text_token = len(output_audio_parts)
-
-    if output_audio_start_seconds is None:
+    if not output_audio_parts or output_audio_start_seconds is None:
         raise RuntimeError(
-            f"Hibiki produced no audio for {path_to_original_audio}."
+            f"Hibiki produced no streaming audio for "
+            f"{path_to_original_audio}."
         )
 
-    if not eos_generated:
+    if text_tokenizer.eos_id() in generated_text_token_ids:
+        output_eos_index = generated_text_token_ids.index(
+            text_tokenizer.eos_id()
+        )
+        text_tokens_to_decode = generated_text_token_ids[:output_eos_index]
+    else:
         warnings.warn(
             f"Hibiki produced no output EOS token for "
-            f"{path_to_original_audio}. The output is truncated after the "
-            f"last generated text token.",
+            f"{path_to_original_audio} within "
+            f"{generation_window_seconds:.1f} seconds. The streaming output "
+            f"is truncated after the last generated text token.",
             RuntimeWarning,
         )
         if parts_after_last_text_token is None:
@@ -439,20 +567,25 @@ def generate_translation(path_to_original_audio: Path,
                 f"Hibiki produced neither an EOS token nor a non-padding "
                 f"text token for {path_to_original_audio}."
             )
-        output_audio_parts = output_audio_parts[:parts_after_last_text_token]
+        output_audio_parts = output_audio_parts[
+            :parts_after_last_text_token
+        ]
+        text_tokens_to_decode = generated_text_token_ids
 
-    # Remove PAD, BOS and other reserved tokens from the text.
     translated_text_token_ids = [
         token_id
-        for token_id in generated_text_token_ids
+        for token_id in text_tokens_to_decode
         if token_id > text_tokenizer.pad_id()
            and token_id != text_tokenizer.eos_id()
     ]
-
     translated_text = text_tokenizer.decode(
         translated_text_token_ids
     )
 
+    # This WAV contains the PCM chunks produced by the live decoding path in
+    # send order. Silence inserted between chunks preserves runtime stalls on
+    # the reconstructed zero-buffer playback timeline. The initial delay before
+    # the first chunk remains separate in output_audio_start_delay.
     output_wav = torch.cat(
         output_audio_parts,
         dim=-1,
@@ -472,97 +605,8 @@ def generate_translation(path_to_original_audio: Path,
     return GeneratedTranslation(
         translated_text=translated_text,
         path_to_translated_audio=output_audio_path,
-        output_audio_start_delay=(
-            output_audio_start_seconds
-        ),
+        output_audio_start_delay=output_audio_start_seconds,
     )
-
-    ########################################################################################################
-    ########################################################################################################
-
-
-    ########################################################################################################
-    ########################################################################################################
-    ########################################################################################################
-    # Just copy pasted for a Proof of Concept
-    # TODO: Code review/revision/description
-    ########################################################################################################
-    ########################################################################################################
-    ########################################################################################################
-def append_audio_chunk_to_timeline(
-        audio_parts: list[torch.Tensor],
-        audio_chunk: torch.Tensor,
-        chunk_ready_seconds: float,
-        output_audio_start_seconds: float | None,
-        current_output_duration_seconds: float,
-        sample_rate: int,
-) -> tuple[float, float]:
-    """
-    Adds a decoded audio chunk to the reconstructed playback timeline.
-
-    If a chunk becomes available too late for uninterrupted playback,
-    silence is inserted. Therefore, the saved WAV also represents
-    generation stalls that would be audible during real-time playback.
-
-    Returns:
-        output_audio_start_seconds
-        updated current_output_duration_seconds
-    """
-    chunk_duration_seconds = (
-            audio_chunk.shape[-1] / sample_rate
-    )
-
-    if output_audio_start_seconds is None:
-        output_audio_start_seconds = chunk_ready_seconds
-        audio_parts.append(audio_chunk)
-
-        return (
-            output_audio_start_seconds,
-            chunk_duration_seconds,
-        )
-
-    # Position at which this chunk becomes available, measured
-    # relative to the start of the output WAV.
-    chunk_available_in_output_seconds = (
-            chunk_ready_seconds
-            - output_audio_start_seconds
-    )
-
-    # If playback has already reached the current end of the file
-    # before the next chunk is ready, this difference is an audible gap.
-    gap_seconds = (
-            chunk_available_in_output_seconds
-            - current_output_duration_seconds
-    )
-
-    if gap_seconds > 0:
-        gap_samples = round(gap_seconds * sample_rate)
-
-        silence = torch.zeros(
-            audio_chunk.shape[0],
-            gap_samples,
-            dtype=audio_chunk.dtype,
-        )
-
-        audio_parts.append(silence)
-
-        current_output_duration_seconds += (
-                gap_samples / sample_rate
-        )
-
-    audio_parts.append(audio_chunk)
-
-    current_output_duration_seconds += (
-        chunk_duration_seconds
-    )
-
-    return (
-        output_audio_start_seconds,
-        current_output_duration_seconds,
-    )
-    ########################################################################################################
-    ########################################################################################################
-
 
 
 if __name__ == "__main__":
