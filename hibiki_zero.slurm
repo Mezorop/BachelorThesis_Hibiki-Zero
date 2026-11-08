@@ -14,6 +14,8 @@ set -euo pipefail
 module purge
 #Adding Python to the running environment
 module load python/3.12.8-gcc-12.2.0-4y5tbpr
+#Adding FFmpeg to the running environment
+module load ffmpeg/4.4.1-gcc-12.2.0-d54gcg6
 
 #Activating pre built Python Virtual Environment
 source "$DATA/venvs/hibiki-zero/bin/activate"

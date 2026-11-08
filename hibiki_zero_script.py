@@ -15,7 +15,7 @@ from pathlib import Path
 
 import sentencepiece
 import torch
-import sphn
+
 from hibiki_zero.client_utils import audio_read
 from hibiki_zero.run import DEFAULT_REPO
 
@@ -472,53 +472,61 @@ def generate_translation(path_to_original_audio: Path,
 
                 ########## Benchmark ##########
 
-                #First output chunk is available therefore the timer for TTFA is set.
+                #time that passed since the start of the input audio stream till the generation of the translated audio chunk
                 chunk_ready_seconds = (
                         time.perf_counter()
                         - input_stream_started_at
                 )
-                #For the first frame of the audio sequence
+
+                #For the first frame of the audio sequence (important for TTFA measurement)
                 if output_audio_start_seconds is None:
                     output_audio_start_seconds = chunk_ready_seconds
                 else:
-                    # Reconstruct a zero-buffer playback timeline. If the WAV
-                    # content collected so far would already have finished
-                    # playing before this chunk became available, the missing
-                    # interval is an audible runtime gap and is represented by
-                    # silence. Forced-alignment timestamps therefore retain
-                    # internal generation stalls.
+                    #To accurately calculate TTFA and End Offset (by force aligning time stamps to output words) it is necessary
+                    #to add the processing time that exceeds the play time of the last output audio chunk as silence
+                    #into the final output audio
+
+                    #Time that passed since the first output chunk was ready and the moment the current output chunk was ready
                     chunk_available_in_output_seconds = (
                             chunk_ready_seconds
                             - output_audio_start_seconds
                     )
+
+                    #Time that passed since the audio chunk that was calculated before stopped "playing".
+                    #Chunk x ended at 1,24 seconds, Chunk x+1 was ready at 1,30 -> therefore a gap of 0,06 seconds needs
+                    #to be filled with silence
                     gap_seconds = (
                             chunk_available_in_output_seconds
-                            - current_output_duration_seconds
+                            - current_output_duration_seconds #Sum of output audio durations and already occurred gaps
                     )
+
+                    #Model runs on 24000 samples per second (see "sample_rate" declaration section)
                     gap_samples = max(
                         0,
                         round(gap_seconds * sample_rate),
                     )
 
                     if gap_samples > 0:
+                        #Fills the output audio with silence
                         output_audio_parts.append(
                             torch.zeros(
-                                decoded_chunk.shape[0],  # 1 (Batch amount)
+                                decoded_chunk.shape[0],  #1 (Batch amount)
                                 gap_samples,
                                 dtype=decoded_chunk.dtype,
                                 device=decoded_chunk.device,
                             )
                         )
+                        #Adds the gaps to the output duration
                         current_output_duration_seconds += (
                                 gap_samples / sample_rate
                         )
-                ########## Benchmark end ##########
 
-                #decoded output audio is added
+                #decoded output audio is added after the added silence gap
                 output_audio_parts.append(decoded_chunk)
                 current_output_duration_seconds += (
                         decoded_chunk.shape[-1] / sample_rate
                 )
+                ########## Benchmark end ##########
 
                 #Right before the Benchmark code the audio streams where selected and decoded (line ~471) next step is to retrieve
                 #the text token at index 0.
@@ -527,15 +535,21 @@ def generate_translation(path_to_original_audio: Path,
                 #text_token_ids are collected
                 generated_text_token_ids.append(text_token_id)
 
+                #If EOS token is not being produced before the 120 * 12,5 frames ended, the model needs to know
+                #when the last text token with actual content was produced
+                #A token with content is one that has an ID > 3
+                #Token with ID 3 is a Padding token
+                #https://huggingface.co/kyutai/hibiki-zero-3b-pytorch-bf16/blob/main/config.json last visit: 7.11.26
+                #As stated in row 164 hibiki uses the text tokenizer of Googles sentencepiece therefore:
+                #Token ID 0 -> Unknown | ID 1 -> beginning of sequence | ID 2 -> end of sequence
+                #https://github.com/google/sentencepiece/blob/master/doc/special_symbols.md#customizing-default-special-symbols-unk-bos-eos-pad last visit: 7.11.26
                 if text_token_id > text_tokenizer.pad_id():
                     parts_after_last_text_token = len(output_audio_parts)
 
-                # The official server reports output EOS but keeps the socket
-                # alive. A finite-file evaluation can end once both the source
-                # EOS was supplied and the target EOS was generated.
+
                 if (
                         input_eos_sent
-                        and text_token_id == text_tokenizer.eos_id()
+                        and text_token_id == text_tokenizer.eos_id() #As stated above text_tokenizer.eos_id() == 2
                 ):
                     eos_generated = True
                     break
@@ -549,6 +563,7 @@ def generate_translation(path_to_original_audio: Path,
             f"{path_to_original_audio}."
         )
 
+    #Cuts of all text_token_ids that are after the EOS token
     if text_tokenizer.eos_id() in generated_text_token_ids:
         output_eos_index = generated_text_token_ids.index(
             text_tokenizer.eos_id()
@@ -567,28 +582,39 @@ def generate_translation(path_to_original_audio: Path,
                 f"Hibiki produced neither an EOS token nor a non-padding "
                 f"text token for {path_to_original_audio}."
             )
+        #Uses the value calculated in row 547 to cut of audio parts that are after the last text token that included translated text.
         output_audio_parts = output_audio_parts[
             :parts_after_last_text_token
         ]
         text_tokens_to_decode = generated_text_token_ids
 
+    #Filters text tokens that don't hold translated text content
+    #https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L250 last visit: 08.11.2026
     translated_text_token_ids = [
         token_id
         for token_id in text_tokens_to_decode
         if token_id > text_tokenizer.pad_id()
-           and token_id != text_tokenizer.eos_id()
     ]
+
+    #From ids to actual words
+    #https://github.com/kyutai-labs/hibiki-zero/blob/871e89d078202c7d9d18d0924bd76cf161cd6606/hibiki_zero/inference.py#L251
     translated_text = text_tokenizer.decode(
         translated_text_token_ids
     )
 
-    # This WAV contains the PCM chunks produced by the live decoding path in
-    # send order. Silence inserted between chunks preserves runtime stalls on
-    # the reconstructed zero-buffer playback timeline. The initial delay before
-    # the first chunk remains separate in output_audio_start_delay.
+    #Final output audio which includes the output chunks as well as the added silent audio gaps
     output_wav = torch.cat(
         output_audio_parts,
         dim=-1,
+    )
+
+    ########## Preprocessing the sample rate to 16kHz for the Whisper model ##########
+    import subprocess
+
+    whisper_sample_rate = 16_000
+    #(240000 / 24000) * 16000 = 160000 samples
+    expected_whisper_sample_count = round(
+        output_wav.shape[-1] * whisper_sample_rate / sample_rate
     )
 
     output_audio_path.parent.mkdir(
@@ -596,11 +622,45 @@ def generate_translation(path_to_original_audio: Path,
         exist_ok=True,
     )
 
-    sphn.write_wav(
-        output_audio_path,
-        output_wav.numpy(),
-        sample_rate,
+    ffmpeg_filter = (
+        #Resamples the input (output audio of hibiki) to 16kHz
+        #https://ffmpeg.org/ffmpeg-filters.html#aresample last visit: 08.11.2026
+        f"aresample={whisper_sample_rate},"
+        #Adds silence to the end if the output has less than the expected sample count
+        #https://ffmpeg.org/ffmpeg-filters.html#apad last visit: 08.11.2026
+        f"apad=whole_len={expected_whisper_sample_count}," 
+        #Cuts of samples that are over the expected sample count
+        #https://ffmpeg.org/ffmpeg-filters.html#atrim last visit: 08.11.2026
+        f"atrim=end_sample={expected_whisper_sample_count}"
     )
+    ffmpeg_command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",                    #"Overwrite output files without asking." https://ffmpeg.org/ffmpeg.html#Main-options last visit: 08.11.2026
+        "-f", "f32le",           #Defines the input format as float 32 bit little endian == "<f4" (See below at subprocess.run) https://ffmpeg.org/ffmpeg.html#Main-options last visit: 08.11.2026
+        "-ar", str(sample_rate), #Defines the input sample rate as 24kHz https://ffmpeg.org/ffmpeg.html#Audio-Options last visit: 08.11.2026
+        "-ac", "1",              #Defines the input audio as being mono https://ffmpeg.org/ffmpeg.html#Audio-Options last visit: 08.11.2026
+        "-i", "pipe:0",
+        "-af", ffmpeg_filter,    #Selects ffmpeg_filter as filtergraph https://ffmpeg.org/ffmpeg.html#Audio-Options last visit: 08.11.2026
+        "-c:a", "pcm_s16le",
+        str(output_audio_path),
+    ]
+
+    try:
+        subprocess.run(
+            ffmpeg_command,
+            #<f4 == little-endian 32-bit floating-point number
+            #https://numpy.org/doc/stable/reference/arrays.dtypes.html#index-6 last visit: 08.11.2026
+            input=output_wav.numpy().astype("<f4", copy=False).tobytes(),
+            check=True,
+        )
+
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            f"FFmpeg failed to create the 16 kHz Whisper WAV at "
+            f"{output_audio_path}."
+        ) from error
 
     return GeneratedTranslation(
         translated_text=translated_text,
