@@ -83,16 +83,6 @@ class ModelResult:
     # Time that passed since the start of the input audio till the first chunk of the output audio (maybe silence)
     output_audio_start_delay: float
 
-    # The following fields are being filled upon post-processing the performance/quality
-    # Time that passed from the beginning of the first input word till the beginning of the first output word
-    # float | None is seen as an exclusive "OR" typification
-    ttfa: float | None = None
-    # Time that passed from the end of the last input word till the end of the last output word
-    end_offset: float | None = None
-    bleu: float | None = None
-    asr_bleu: float | None = None
-    asr_comet: float | None = None
-
 
 def main() -> None:
     (
